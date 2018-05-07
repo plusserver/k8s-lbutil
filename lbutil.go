@@ -188,7 +188,7 @@ func RequestAddress(kube kubernetes.Interface, ipamclient ipamclientset.Interfac
 			}},
 		},
 		Spec: ipamv1.IpAddressSpec{
-			Comment: fmt.Sprintf("created for service %s", service.Name),
+			Description: fmt.Sprintf("created for service %s", service.Name),
 		},
 	}
 
