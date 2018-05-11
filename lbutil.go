@@ -4,13 +4,16 @@ package lbutil
 
 import (
 	"fmt"
+
 	log "github.com/sirupsen/logrus"
 
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/util/workqueue"
 
-	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	corev1 "k8s.io/api/core/v1"
+	corelisterv1 "k8s.io/client-go/listers/core/v1"
 
 	ipamv1 "github.com/Nexinto/k8s-ipam/pkg/apis/ipam.nexinto.com/v1"
 	ipamclientset "github.com/Nexinto/k8s-ipam/pkg/client/clientset/versioned"
@@ -22,29 +25,14 @@ const (
 	// If set to any value, a VIP will be configured.
 	AnnNxReqVIP = "nexinto.com/req-vip"
 
-	// This will be set to the VIP.
+	// This will be set to the VIP. If set, the Loadbalancer was configured successfully.
 	AnnNxVIP = "nexinto.com/vip"
 
-	// This annotation contains the VIP that is cofigured by the k8s-bigip-ctlr.
-	AnnVirtualServerIP = "virtual-server.f5.com/ip"
-
-	// The k8s-bigip-ctlr will set this to the VIP once it is configured on the loadbalancer.
-	AnnVirtualServerIPStatus = "status.virtual-server.f5.com/ip"
-
-	// This annotation selects one or more SSL profile
-	AnnNxSSLProfiles = "nexinto.com/vip-ssl-profiles"
-
-	// VIP Mode (http or tcp, http is the default)
-	AnnNxVipMode = "nexinto.com/req-vip-mode"
+	// This will be the VIP chosen for the service.
+	AnnNxAssignedVIP = "nexinto.com/assigned-vip"
 
 	// Set this to explicitly choose a VIP provider.
 	AnnNxVIPProvider = "nexinto.com/vip-provider"
-
-	// bigip provider
-	AnnNxVIPProviderBigIP = "bigip"
-
-	// fortigate provider
-	AnnNxVIPProviderFortigate = "fortigate"
 
 	// The active provider for this VIP.
 	AnnNxVIPActiveProvider = "nexinto.com/vip-active-provider"
@@ -93,85 +81,81 @@ func LogEventAndFail(kube kubernetes.Interface, o metav1.Object, message string)
 // if it is false, the caller must stop processing and retry later.
 // If there is no error and it is ok to continue, use the returned "newservice" to query the VIP or to make changes to the Service,
 // not your original service because the original came from the cache and should not be modified.
+// If 'needsUpdate' is true, then the service copy was modified and needs to be updated by the caller.
 func EnsureVIP(kube kubernetes.Interface, ipamclient ipamclientset.Interface, addressLister ipamlisterv1.IpAddressLister,
-	service *corev1.Service, controllerName string, requireAnnotation bool) (ok bool, newservice *corev1.Service, err error) {
+	service *corev1.Service, controllerName string, requireAnnotation bool) (ok bool, needsUpdate bool, newservice *corev1.Service, err error) {
 
 	if service.Spec.Type != corev1.ServiceTypeNodePort {
 		log.Debugf("skipping '%s-%s': not a NodePort", service.Namespace, service.Name)
-		return false, nil, nil
+		return false, false, nil, nil
 	}
 
 	if requireAnnotation && service.Annotations[AnnNxReqVIP] == "" {
 		log.Debugf("skipping '%s-%s': REQUIRE_TAG is true and service does not have our annotation", service.Namespace, service.Name)
-		return false, nil, nil
+		return false, false, nil, nil
 	}
 
 	if service.Annotations[AnnNxVIPProvider] != "" && service.Annotations[AnnNxVIPProvider] != controllerName {
 		log.Debugf("skipping '%s-%s': service requests provider '%s'", service.Namespace, service.Name, service.Annotations[AnnNxVIPProvider])
-		return false, nil, nil
+		return false, false, nil, nil
 	}
 
 	if service.Annotations[AnnNxVIPActiveProvider] != "" && service.Annotations[AnnNxVIPActiveProvider] != controllerName {
 		log.Debugf("skipping '%s-%s': service is managed by provider '%s'", service.Namespace, service.Name, service.Annotations[AnnNxVIPActiveProvider])
-		return false, nil, nil
+		return false, false, nil, nil
 	}
 
 	if service.Annotations[AnnNxVIPActiveProvider] == "" {
+
+		log.Debugf("trying to claim the service")
+
 		// Try to claim the service
 		newservice := service.DeepCopy()
 		newservice.Annotations[AnnNxVIPActiveProvider] = controllerName
 
-		_, err := kube.CoreV1().Services(service.Namespace).Update(newservice)
-		if err != nil {
-			return false, nil, fmt.Errorf("error updating service '%s-%s': %s", service.Namespace, service.Name, err.Error())
-		}
-
-		return false, nil, nil
+		return false, true, newservice, nil
 	}
 
 	addr, addrLookupErr := addressLister.IpAddresses(service.Namespace).Get(service.Name)
 	if err != nil && !errors.IsNotFound(addrLookupErr) {
 		// General error getting the address. NotFound is handled below depending on context.
-		return false, nil, fmt.Errorf("error looking up ipaddress object for service '%s-%s': %s", service.Namespace, service.Name, err.Error())
+		return false, false, nil, fmt.Errorf("error looking up ipaddress object for service '%s-%s': %s", service.Namespace, service.Name, err.Error())
 	}
 
-	if service.Annotations[AnnNxVIP] == "" {
+	if service.Annotations[AnnNxAssignedVIP] == "" {
 		// A VIP is not yet set for the Service.
 
 		if errors.IsNotFound(addrLookupErr) {
 			log.Debugf("no address for '%s-%s' exists", service.Namespace, service.Name)
-			return false, nil, RequestAddress(kube, ipamclient, service)
+			return false, false, nil, RequestAddress(kube, ipamclient, service)
 		}
 
 		if addr.Status.Address == "" {
 			log.Debugf("ip address '%s-%s' has no address yet", addr.Namespace, addr.Name)
-			return false, nil, nil
+			return false, false, nil, nil
 		}
 
-		newservice, err := StoreVIP(addr.Status.Address, kube, service)
-		if err != nil {
-			return false, nil, err
-		}
+		newservice := StoreVIP(addr.Status.Address, kube, service)
 
-		return true, newservice, nil
+		return true, needsUpdate, newservice, nil
 	}
 
 	if errors.IsNotFound(addrLookupErr) {
 		// The IP address object for our service has somehow disappeared. Reset the stored address
 		// and restart the process.
-		log.Infof("assigned IP address for service '%s-%s' has disappeared (was %s)", service.Namespace, service.Name, service.Annotations[AnnNxVIP])
-		newservice, err := StoreVIP("", kube, service)
-		return false, newservice, err
+		log.Infof("assigned IP address for service '%s-%s' has disappeared (was %s)", service.Namespace, service.Name, service.Annotations[AnnNxAssignedVIP])
+		newservice := StoreVIP("", kube, service)
+		return false, true, newservice, err
 	}
 
-	if addr.Status.Address != service.Annotations[AnnNxVIP] {
+	if addr.Status.Address != service.Annotations[AnnNxAssignedVIP] {
 		// The IP address has changed. Set the new address and continue.
-		log.Infof("assigned IP address for service '%s-%s' has changed (from %s to %s)", service.Namespace, service.Name, addr.Status.Address, service.Annotations[AnnNxVIP])
-		newservice, err := StoreVIP("", kube, service)
-		return true, newservice, err
+		log.Infof("assigned IP address for service '%s-%s' has changed (from %s to %s)", service.Namespace, service.Name, addr.Status.Address, service.Annotations[AnnNxAssignedVIP])
+		newservice := StoreVIP("", kube, service)
+		return true, true, newservice, err
 	}
 
-	return true, service, nil
+	return true, needsUpdate, service, nil
 }
 
 // Create a new IpAddress Object for a Service.
@@ -202,16 +186,52 @@ func RequestAddress(kube kubernetes.Interface, ipamclient ipamclientset.Interfac
 	return nil
 }
 
-func StoreVIP(vip string, kube kubernetes.Interface, service *corev1.Service) (*corev1.Service, error) {
+func StoreVIP(vip string, kube kubernetes.Interface, service *corev1.Service) *corev1.Service {
 	o2 := service.DeepCopy()
-	o2.Annotations[AnnNxVIP] = vip
+	o2.Annotations[AnnNxAssignedVIP] = vip
 
-	_, err := kube.CoreV1().Services(service.Namespace).Update(o2)
-	if err != nil {
-		return nil, fmt.Errorf("error updating service '%s-%s': %s", service.Namespace, service.Name, err.Error())
-	}
-
+	log.Debugf("storing assigned VIP '%s' for service '%s-%s'", vip, service.Namespace, service.Name)
 	_ = MakeEvent(kube, service, fmt.Sprintf("assigned VIP %s", vip), false)
 
-	return o2, nil
+	return o2
+}
+
+// If an IP address object changes and a Service is an owner, wake up that Service.
+func IpAddressCreatedOrUpdated(serviceQueue workqueue.RateLimitingInterface, address *ipamv1.IpAddress) {
+	if address.Status.Address != "" {
+		for _, ref := range address.OwnerReferences {
+			if ref.Kind == "Service" && ref.APIVersion == "v1" {
+				log.Debugf("change to ipaddress '%s-%s' wakes up service '%s-%s'", address.Namespace, address.Name, address.Namespace, ref.Name)
+				serviceQueue.Add(fmt.Sprintf("%s/%s", address.Namespace, ref.Name))
+			}
+		}
+	}
+}
+
+// If an IP address is deleted and a Service is the owner and it still exists, remove
+// the VIP annotation and wake up the service so the service can retry requesting loadbalancing.
+func IpAddressDeleted(kubernetes kubernetes.Interface, serviceLister corelisterv1.ServiceLister, address *ipamv1.IpAddress) error {
+	for _, ref := range address.OwnerReferences {
+		if ref.Kind == "Service" && ref.APIVersion == "v1" {
+			service, err := serviceLister.Services(metav1.NamespaceAll).Get(ref.Name)
+			if err != nil {
+				if errors.IsNotFound(err) {
+					continue
+				} else {
+					return err
+				}
+			}
+			if service.Annotations[AnnNxAssignedVIP] != "" {
+				log.Debugf("ipaddress '%s-%s' was deleted; resetting service '%s-%s'", address.Namespace, address.Name, address.Namespace, service.Name)
+				newService := service.DeepCopy()
+				newService.Annotations[AnnNxAssignedVIP] = ""
+				_, err = kubernetes.CoreV1().Services(newService.Namespace).Update(newService)
+				if err != nil {
+					return err
+				}
+			}
+		}
+	}
+
+	return nil
 }
