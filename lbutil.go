@@ -11,8 +11,8 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/util/workqueue"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corelisterv1 "k8s.io/client-go/listers/core/v1"
 
 	ipamv1 "github.com/Nexinto/k8s-ipam/pkg/apis/ipam.nexinto.com/v1"
@@ -111,6 +111,9 @@ func EnsureVIP(kube kubernetes.Interface, ipamclient ipamclientset.Interface, ad
 
 		// Try to claim the service
 		newservice := service.DeepCopy()
+		if newservice.Annotations == nil {
+			newservice.Annotations = map[string]string{}
+		}
 		newservice.Annotations[AnnNxVIPActiveProvider] = controllerName
 
 		return false, true, newservice, nil
@@ -137,7 +140,7 @@ func EnsureVIP(kube kubernetes.Interface, ipamclient ipamclientset.Interface, ad
 
 		newservice := StoreVIP(addr.Status.Address, kube, service)
 
-		return true, needsUpdate, newservice, nil
+		return true, true, newservice, nil
 	}
 
 	if errors.IsNotFound(addrLookupErr) {
@@ -229,6 +232,32 @@ func IpAddressDeleted(kubernetes kubernetes.Interface, serviceLister corelisterv
 				if err != nil {
 					return err
 				}
+			}
+		}
+	}
+
+	return nil
+}
+
+// Simulates the behaviour of the ipam controller.
+func SimIPAM(ipamclient ipamclientset.Interface) error {
+	i := 1
+
+	addrs, err := ipamclient.IpamV1().IpAddresses(metav1.NamespaceAll).List(metav1.ListOptions{})
+	if err != nil {
+		return err
+	}
+
+	for _, addr := range addrs.Items {
+		if addr.Status.Address == "" {
+			addr.Status.Address = fmt.Sprintf("10.0.0.%d", i)
+			i++
+			_, err := ipamclient.IpamV1().IpAddresses(addr.Namespace).Update(&addr)
+
+			log.Debugf("[simIPAM] assign: %s/%s -> %s", addr.Namespace, addr.Name, addr.Status.Address)
+
+			if err != nil {
+				return err
 			}
 		}
 	}
