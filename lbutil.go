@@ -203,8 +203,7 @@ func StoreVIP(vip string, kube kubernetes.Interface, service *corev1.Service) *c
 func IpAddressCreatedOrUpdated(serviceQueue workqueue.RateLimitingInterface, address *ipamv1.IpAddress) {
 	if address.Status.Address != "" {
 		for _, ref := range address.OwnerReferences {
-			if ref.Kind == "Service" && ref.APIVersion == "v1" {
-				log.Debugf("change to ipaddress '%s-%s' wakes up service '%s-%s'", address.Namespace, address.Name, address.Namespace, ref.Name)
+			if ref.Kind == "Service" {
 				serviceQueue.Add(fmt.Sprintf("%s/%s", address.Namespace, ref.Name))
 			}
 		}
